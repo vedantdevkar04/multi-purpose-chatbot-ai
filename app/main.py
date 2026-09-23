@@ -20,16 +20,26 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 
 from .chunking import chunk_pages
 from .config import settings
+from .dependencies import EmbeddingServiceDep, lifespan
+from .embedding import EmbeddingError
 from .extraction import UnsupportedFormatError, extract
-from .models import ChunkRequest, ChunkResponse, ExtractResponse, IngestResponse
+from .models import (
+    ChunkRequest,
+    ChunkResponse,
+    EmbedRequest,
+    EmbedResponse,
+    ExtractResponse,
+    IngestResponse,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Chatbot AI Service",
-    description="Stateless extraction and chunking for the multi-tenant chatbot.",
-    version="0.1.0",
+    description="Stateless extraction, chunking and embedding for the multi-tenant chatbot.",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 
@@ -41,9 +51,11 @@ def health() -> dict[str, str]:
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(
+    service: EmbeddingServiceDep,
     file: UploadFile = File(...),
     chunk_size_chars: int = Form(1000),
     overlap_chars: int = Form(150),
+    embed_chunks: bool = Form(True),
 ) -> IngestResponse:
     """Extract and chunk in one round trip — the common case for an upload.
 
@@ -63,12 +75,37 @@ async def ingest(
     # and knows nothing.
     chunks = [] if is_empty else chunk_pages(pages, chunk_size_chars, overlap_chars)
 
+    embedding_model: str | None = None
+
+    if chunks and embed_chunks:
+        try:
+            vectors = await service.embed_texts([c.content for c in chunks])
+
+            for chunk, vector in zip(chunks, vectors, strict=True):
+                chunk.embedding = vector
+
+            embedding_model = service.model
+
+        except EmbeddingError as exc:
+            # Deliberately NOT fatal.
+            #
+            # Extraction and chunking are the expensive, irreversible work; the
+            # embeddings can be generated later from text already stored. If
+            # Ollama happens to be down, returning the chunks unembedded lets
+            # the caller keep them and backfill, rather than discarding a parsed
+            # document and asking the customer to upload it again.
+            #
+            # embedding_model stays None, which is how the caller knows.
+            logger.error("Embedding failed for %s, returning chunks unembedded: %s",
+                         file.filename, exc)
+
     logger.info(
-        "Ingested %s: %d page(s), %d chunk(s), %d chars",
+        "Ingested %s: %d page(s), %d chunk(s), %d chars, embedded=%s",
         file.filename,
         len(pages),
         len(chunks),
         len(full_text),
+        embedding_model is not None,
     )
 
     return IngestResponse(
@@ -77,6 +114,7 @@ async def ingest(
         is_empty=is_empty,
         chunks=chunks,
         full_text=full_text,
+        embedding_model=embedding_model,
     )
 
 
@@ -91,6 +129,32 @@ async def extract_only(file: UploadFile = File(...)) -> ExtractResponse:
         pages=pages,
         page_count=len(pages) if any(p.number for p in pages) else None,
         is_empty=not full_text.strip(),
+    )
+
+
+@app.post("/embed", response_model=EmbedResponse)
+async def embed(request: EmbedRequest, service: EmbeddingServiceDep) -> EmbedResponse:
+    """Embed a batch of texts.
+
+    Separate from /ingest because Phase 6 embeds the USER'S QUESTION at chat
+    time, with no document involved. Same model, same code path — which matters,
+    because a question embedded by a different model than the documents would
+    return confident nonsense rather than an error.
+    """
+    try:
+        vectors = await service.embed_texts(request.texts)
+    except EmbeddingError as exc:
+        # 503, not 500: the service itself is fine, its dependency is not.
+        # A caller can reasonably retry.
+        logger.error("Embedding failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    return EmbedResponse(
+        vectors=vectors,
+        model=service.model,
+        dimensions=service.dimensions,
     )
 
 
